@@ -17,6 +17,15 @@ import { renderSlide, renderThumbnail } from '../render'
 import { SlideCanvas } from './canvas'
 import { PropsPanel } from './panels'
 import { openCtxMenu, type CtxItem } from './ctxmenu'
+
+/** How long a finger must rest before a press becomes a menu. 500ms is what
+ *  iOS itself uses for the callout, so it matches the muscle memory already on
+ *  the device. */
+const LONG_PRESS_MS = 500
+/** …and how far it may wander first. Past this it was a drag or a pan. */
+const LONG_PRESS_SLOP = 10
+/** How long to hold off the release burst after the menu appears. */
+const TAP_AFTER_PRESS_MS = 500
 import { startPresentation } from '../present'
 import { adoptFileHandle, canWriteInPlace, currentFileName, fileBase, hasFileHandle, isEncryptionActive, openedFileName, saveFile, serializeAuto, serializeFile, setEncryptionPassword, writeUpdatedFile, writeUpdatedFileAs } from '../save'
 import { addVersion, clearRecovery, clearVersions, docContentKey, getRecovery, listVersions, pruneOld, putRecovery, type Snapshot } from '../autosave'
@@ -2697,38 +2706,108 @@ export class Editor {
     }, true)
 
     document.addEventListener('contextmenu', (ev) => {
-      // Leave the browser's own menu wherever it is the better one: form
-      // fields, links, and above all a text element mid-edit, where the native
-      // menu carries spelling, dictation, look-up and the system paste.
       const target = ev.target as HTMLElement | null
-      if (!target?.closest) return
-      if (target.closest('input, textarea, a, [contenteditable="true"]')) return
-      // Text mid-edit belongs to the SYSTEM menu — spelling, dictation,
-      // look-up and a real paste are all things this menu cannot offer. Only
-      // when the press landed IN the text being edited, though: a right-click
-      // elsewhere commits the edit and is a click on whatever it hit.
       if (pressInsideEdit) return
-      if (this.store.readOnly || this.presenting) return
-
-      const thumb = target.closest<HTMLElement>('.ed-sidebar .ed-thumb')
-      if (thumb) {
-        ev.preventDefault()
-        openCtxMenu(ev.clientX, ev.clientY, this.slideMenuItems(Number(thumb.dataset.index), thumb))
-        return
-      }
-      if (!target.closest('.ed-scroll')) return // not the canvas — leave it alone
-      ev.preventDefault()
-      const id = this.elementIdAtPoint(ev.clientX, ev.clientY)
-      if (!id) {
-        openCtxMenu(ev.clientX, ev.clientY, this.canvasMenuItems())
-        return
-      }
-      // Right-clicking outside the selection moves it there first — the rule
-      // every editor follows, and the only way the menu's verbs can be honest
-      // about what they will act on.
-      if (!this.store.selection.includes(id)) this.store.select([id])
-      openCtxMenu(ev.clientX, ev.clientY, this.elementMenuItems())
+      if (this.openContextMenuAt(target, ev.clientX, ev.clientY)) ev.preventDefault()
     })
+
+    this.wireLongPress()
+  }
+
+  /**
+   * Open the right menu for whatever is at (x, y), or return false to say "not
+   * mine" — which is how the browser's own menu survives wherever it is the
+   * better one: form fields, links, and text mid-edit, where the system
+   * carries spelling, dictation, look-up and a real paste.
+   *
+   * Shared by the right-click and the long press, so the two can never drift.
+   */
+  private openContextMenuAt(target: HTMLElement | null, x: number, y: number): boolean {
+    if (!target?.closest) return false
+    if (target.closest('input, textarea, a, [contenteditable="true"]')) return false
+    if (this.store.readOnly || this.presenting) return false
+
+    const thumb = target.closest<HTMLElement>('.ed-sidebar .ed-thumb')
+    if (thumb) {
+      openCtxMenu(x, y, this.slideMenuItems(Number(thumb.dataset.index), thumb))
+      return true
+    }
+    if (!target.closest('.ed-scroll')) return false // not the canvas — leave it alone
+    const id = this.elementIdAtPoint(x, y)
+    if (!id) {
+      openCtxMenu(x, y, this.canvasMenuItems())
+      return true
+    }
+    // Aiming outside the selection moves it there first — the rule every editor
+    // follows, and the only way the menu's verbs can be honest about what they
+    // will act on.
+    if (!this.store.selection.includes(id)) this.store.select([id])
+    openCtxMenu(x, y, this.elementMenuItems())
+    return true
+  }
+
+  /**
+   * Touch: a press held in place IS the right-click.
+   *
+   * It has to be recognised by hand. iOS fires no `contextmenu` event for an
+   * ordinary element — a long press there raises the system callout, not a
+   * menu — so without this the whole feature above is mouse-only, and a phone
+   * keeps having no way to reach Duplicate, Delete, Group or the z-order.
+   *
+   * Cancelled by movement (that press was a drag or a pan) and by an early
+   * lift (that was a tap). Both matter: this listener sits on the same surface
+   * Moveable drags elements on, and stealing a drag would be worse than having
+   * no menu at all.
+   */
+  private wireLongPress() {
+    let press: { x: number; y: number; target: HTMLElement; timer: number } | null = null
+    const cancel = () => {
+      if (!press) return
+      clearTimeout(press.timer)
+      press = null
+    }
+    this.root.addEventListener('pointerdown', (ev) => {
+      cancel()
+      if (ev.pointerType !== 'touch' || !ev.isPrimary) return
+      const target = ev.target as HTMLElement | null
+      if (!target) return
+      const x = ev.clientX
+      const y = ev.clientY
+      press = {
+        x, y, target,
+        timer: window.setTimeout(() => {
+          press = null
+          // The element under the finger can have changed while the finger was
+          // down (a remote edit, a re-render), so the target is re-read here.
+          const at = (document.elementFromPoint(x, y) as HTMLElement | null) ?? target
+          if (!this.openContextMenuAt(at, x, y)) return
+          // The lift that follows would land as a click ON the menu that just
+          // appeared under the finger — the first row would fire itself. Hold
+          // the burst off until the finger is clear.
+          this.swallowTapAfterLongPress()
+        }, LONG_PRESS_MS),
+      }
+    }, true)
+    this.root.addEventListener('pointermove', (ev) => {
+      if (press && Math.hypot(ev.clientX - press.x, ev.clientY - press.y) > LONG_PRESS_SLOP) cancel()
+    }, true)
+    this.root.addEventListener('pointerup', cancel, true)
+    this.root.addEventListener('pointercancel', cancel, true)
+    // A second finger means a pinch or a two-finger pan, never a press
+    this.root.addEventListener('touchstart', (ev) => {
+      if (ev.touches.length > 1) cancel()
+    }, true)
+  }
+
+  /** Swallow the tap/click burst that ends the long press, so the release
+   *  cannot activate the row that opened underneath the finger. */
+  private swallowTapAfterLongPress() {
+    const kill = (ev: Event) => { ev.stopPropagation(); ev.preventDefault() }
+    const types = ['pointerup', 'mouseup', 'click'] as const
+    for (const t of types) window.addEventListener(t, kill, true)
+    setTimeout(() => {
+      for (const t of types) window.removeEventListener(t, kill, true)
+    }, TAP_AFTER_PRESS_MS)
   }
 
   private elementMenuItems(): CtxItem[] {
