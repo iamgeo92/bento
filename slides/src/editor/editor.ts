@@ -24,8 +24,7 @@ import { openCtxMenu, type CtxItem } from './ctxmenu'
 const LONG_PRESS_MS = 500
 /** …and how far it may wander first. Past this it was a drag or a pan. */
 const LONG_PRESS_SLOP = 10
-/** How long to hold off the release burst after the menu appears. */
-const TAP_AFTER_PRESS_MS = 500
+
 import { startPresentation } from '../present'
 import { adoptFileHandle, canWriteInPlace, currentFileName, fileBase, hasFileHandle, isEncryptionActive, openedFileName, saveFile, serializeAuto, serializeFile, setEncryptionPassword, writeUpdatedFile, writeUpdatedFileAs } from '../save'
 import { addVersion, clearRecovery, clearVersions, docContentKey, getRecovery, listVersions, pruneOld, putRecovery, type Snapshot } from '../autosave'
@@ -2760,54 +2759,50 @@ export class Editor {
    * no menu at all.
    */
   private wireLongPress() {
-    let press: { x: number; y: number; target: HTMLElement; timer: number } | null = null
+    // TOUCH events, not pointer events. A pointer handler runs for a mouse too
+    // and has to filter itself back out by pointerType; cancelling the touchend
+    // then stops the browser SYNTHESIZING the tap that ends the press, instead
+    // of racing it with a listener that swallows mouse events after the fact.
+    // Same reasoning as the tap-to-edit recogniser in canvas.ts.
+    let press: { x: number; y: number; target: HTMLElement; timer: number; opened: boolean } | null = null
     const cancel = () => {
       if (!press) return
       clearTimeout(press.timer)
       press = null
     }
-    this.root.addEventListener('pointerdown', (ev) => {
+    this.root.addEventListener('touchstart', (ev) => {
       cancel()
-      if (ev.pointerType !== 'touch' || !ev.isPrimary) return
+      // a second finger is a pinch or a two-finger pan, never a press
+      if (ev.touches.length !== 1) return
+      const t = ev.touches[0]
       const target = ev.target as HTMLElement | null
       if (!target) return
-      const x = ev.clientX
-      const y = ev.clientY
-      press = {
-        x, y, target,
+      const x = t.clientX
+      const y = t.clientY
+      const p: NonNullable<typeof press> = {
+        x, y, target, opened: false,
         timer: window.setTimeout(() => {
-          press = null
           // The element under the finger can have changed while the finger was
           // down (a remote edit, a re-render), so the target is re-read here.
           const at = (document.elementFromPoint(x, y) as HTMLElement | null) ?? target
-          if (!this.openContextMenuAt(at, x, y)) return
-          // The lift that follows would land as a click ON the menu that just
-          // appeared under the finger — the first row would fire itself. Hold
-          // the burst off until the finger is clear.
-          this.swallowTapAfterLongPress()
+          p.opened = this.openContextMenuAt(at, x, y)
         }, LONG_PRESS_MS),
       }
+      press = p
     }, true)
-    this.root.addEventListener('pointermove', (ev) => {
-      if (press && Math.hypot(ev.clientX - press.x, ev.clientY - press.y) > LONG_PRESS_SLOP) cancel()
+    this.root.addEventListener('touchmove', (ev) => {
+      const t = ev.touches[0]
+      if (press && t && Math.hypot(t.clientX - press.x, t.clientY - press.y) > LONG_PRESS_SLOP) cancel()
     }, true)
-    this.root.addEventListener('pointerup', cancel, true)
-    this.root.addEventListener('pointercancel', cancel, true)
-    // A second finger means a pinch or a two-finger pan, never a press
-    this.root.addEventListener('touchstart', (ev) => {
-      if (ev.touches.length > 1) cancel()
-    }, true)
-  }
-
-  /** Swallow the tap/click burst that ends the long press, so the release
-   *  cannot activate the row that opened underneath the finger. */
-  private swallowTapAfterLongPress() {
-    const kill = (ev: Event) => { ev.stopPropagation(); ev.preventDefault() }
-    const types = ['pointerup', 'mouseup', 'click'] as const
-    for (const t of types) window.addEventListener(t, kill, true)
-    setTimeout(() => {
-      for (const t of types) window.removeEventListener(t, kill, true)
-    }, TAP_AFTER_PRESS_MS)
+    // non-passive: this is the listener that has to be able to cancel
+    this.root.addEventListener('touchend', (ev) => {
+      const p = press
+      cancel()
+      // The lift would otherwise be replayed as a click ON the menu that just
+      // appeared under the finger, and the row beneath it would fire itself.
+      if (p?.opened && ev.cancelable) ev.preventDefault()
+    }, { passive: false })
+    this.root.addEventListener('touchcancel', cancel, true)
   }
 
   private elementMenuItems(): CtxItem[] {
