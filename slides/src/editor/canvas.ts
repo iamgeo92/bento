@@ -26,11 +26,6 @@ import type { Peer } from '../sync/session'
 const TAP_SLOP = 10
 /** …and how long it may rest. Past this it is a press, not a tap. */
 const TAP_HOLD_MS = 700
-/** The compatibility mouse burst follows a touch by ~300ms; 450 covers a slow
- *  frame without reaching far enough to catch a deliberate second interaction. */
-const GHOST_WINDOW_MS = 450
-/** …and it lands within a pixel or two of the touch, never across the screen. */
-const GHOST_SLOP = 25
 
 export class SlideCanvas {
   private stage: HTMLElement
@@ -274,13 +269,24 @@ export class SlideCanvas {
     // a previous tap already selected, so that is what enters editing. Checking
     // the selection first is what keeps it safe: the tap that SELECTS an element
     // can never be the one that opens it, so nothing is swallowed.
+    //
+    // TOUCH events, not pointer events, and deliberately so. A pointer handler
+    // runs for a mouse as well and has to filter itself back out by
+    // pointerType; the compatibility mouse burst it leaves behind then has to
+    // be filtered too — two separate chances to change desktop behaviour by
+    // accident. A touch handler cannot fire for a mouse at all, and cancelling
+    // the touchend stops the browser SYNTHESIZING that burst in the first
+    // place, so there is nothing left to filter. (Suggested by @7jameslondon,
+    // who tested the pointer version on a real iPhone.)
     let tap: { x: number; y: number; t: number; id: string | null; wasSelected: boolean } | null = null
-    this.scroller.addEventListener('pointerdown', (ev) => {
-      if (ev.pointerType !== 'touch' || !ev.isPrimary) { tap = null; return }
-      const id = this.topElementAt(ev.clientX, ev.clientY)
+    this.scroller.addEventListener('touchstart', (ev) => {
+      // a second finger means a pinch, never a tap
+      if (ev.touches.length !== 1) { tap = null; return }
+      const t = ev.touches[0]
+      const id = this.topElementAt(t.clientX, t.clientY)
       const sel = this.store.selection
       tap = {
-        x: ev.clientX, y: ev.clientY, t: ev.timeStamp, id,
+        x: t.clientX, y: t.clientY, t: ev.timeStamp, id,
         // Asked HERE and not on release, because Selecto selects on the press:
         // by the time the finger lifts, the tap that merely selected has
         // already made this element the selection and would open the editor
@@ -288,41 +294,46 @@ export class SlideCanvas {
         wasSelected: !!id && sel.length === 1 && sel[0] === id,
       }
     }, true)
-    this.scroller.addEventListener('pointerup', (ev) => {
+    this.scroller.addEventListener('touchmove', (ev) => {
+      const t = ev.touches[0]
+      if (!tap || !t) return
+      // a moved finger was a drag or a pan, not a tap
+      if (Math.hypot(t.clientX - tap.x, t.clientY - tap.y) > TAP_SLOP) tap = null
+    }, true)
+    // non-passive: this is the listener that has to be able to cancel
+    this.scroller.addEventListener('touchend', (ev) => {
       const start = tap
       tap = null
-      if (!start || ev.pointerType !== 'touch' || this.store.readOnly) return
+      if (!start || ev.touches.length || this.store.readOnly) return
       if (this.editing || this.editingCell || this.isPathEditing) return
-      // a moved finger was a drag or a pan, and a held one is a long press —
-      // both are other gestures, and neither should open an editor
-      if (Math.hypot(ev.clientX - start.x, ev.clientY - start.y) > TAP_SLOP) return
-      if (ev.timeStamp - start.t > TAP_HOLD_MS) return
+      const t = ev.changedTouches[0]
+      if (!t) return
+      if (Math.hypot(t.clientX - start.x, t.clientY - start.y) > TAP_SLOP) return
+      if (ev.timeStamp - start.t > TAP_HOLD_MS) return // a held finger is a press
       if (!start.wasSelected) return // this tap is the one that selects
-      const id = this.topElementAt(ev.clientX, ev.clientY)
+      const id = this.topElementAt(t.clientX, t.clientY)
       if (!id || id !== start.id) return // started and ended on the same element
       const sel = this.store.selection
       if (sel.length !== 1 || sel[0] !== id) return // selection moved under us
       const node = this.scaleHost.querySelector<HTMLElement>(`[data-el-id="${CSS.escape(id)}"]`)
       if (!node) return
+      let opened = false
       if (node.classList.contains('bento-el-text')) {
-        this.swallowGhostMouse(ev.clientX, ev.clientY)
         this.startTextEdit(node)
-        return
+        opened = true
+      } else if (node.classList.contains('bento-el-table')) {
+        // a table opens the CELL under the thumb. Its <td>s are real DOM boxes,
+        // so they can be hit-tested directly — but the control box is above
+        // them, hence the whole stack rather than the topmost node.
+        opened = this.editCellUnder(node, t.clientX, t.clientY)
       }
-      // a table opens the CELL under the thumb. Its <td>s are real DOM boxes, so
-      // they can be hit-tested directly — but the control box is above them,
-      // hence the whole stack rather than the topmost node.
-      if (node.classList.contains('bento-el-table')) {
-        const td = document
-          .elementsFromPoint(ev.clientX, ev.clientY)
-          .map((n) => (n as HTMLElement).closest?.<HTMLElement>('td[data-c]'))
-          .find((n): n is HTMLElement => !!n && node.contains(n))
-        if (td) {
-          this.swallowGhostMouse(ev.clientX, ev.clientY)
-          this.editCellFromTd(td)
-        }
-      }
-    }, true)
+      // Cancel the tap we consumed. Without this the browser replays it as
+      // mousedown → mouseup → click ~300ms later at the ORIGINAL screen point,
+      // which focus() has by then scrolled away from to reveal the caret — so
+      // Selecto read the ghost press as "outside the text being edited" and
+      // committed the edit a blink after it opened.
+      if (opened && ev.cancelable) ev.preventDefault()
+    }, { passive: false })
 
     new ResizeObserver(() => this.relayout()).observe(wrap)
 
@@ -603,32 +614,15 @@ export class SlideCanvas {
     return [...out]
   }
 
-  /**
-   * Swallow the compatibility mouse burst that a browser fires ~300ms after a
-   * touch it did not see prevented (mousedown → mouseup → click).
-   *
-   * It has to go, because it arrives at the ORIGINAL screen point: focusing the
-   * text has by then scrolled the canvas to reveal the caret, so that point is
-   * usually empty space, and Selecto reads the ghost mousedown as "pressed
-   * outside the text being edited" — committing the edit a blink after the tap
-   * opened it. preventDefault matters as much as stopPropagation: without it
-   * the ghost press blurs the contenteditable, and blur commits too.
-   *
-   * Bounded by both time and distance so a real mouse on a hybrid device (a
-   * touchscreen laptop, an iPad with a trackpad) can never be caught by it.
-   */
-  private swallowGhostMouse(x: number, y: number) {
-    const kill = (ev: Event) => {
-      const m = ev as MouseEvent
-      if (Math.hypot(m.clientX - x, m.clientY - y) > GHOST_SLOP) return
-      ev.stopPropagation()
-      ev.preventDefault()
-    }
-    const types = ['mousedown', 'mouseup', 'click'] as const
-    for (const t of types) window.addEventListener(t, kill, true)
-    setTimeout(() => {
-      for (const t of types) window.removeEventListener(t, kill, true)
-    }, GHOST_WINDOW_MS)
+  /** Open the table cell under a client point. Reports whether it found one. */
+  private editCellUnder(node: HTMLElement, x: number, y: number): boolean {
+    const td = document
+      .elementsFromPoint(x, y)
+      .map((n) => (n as HTMLElement).closest?.<HTMLElement>('td[data-c]'))
+      .find((n): n is HTMLElement => !!n && node.contains(n))
+    if (!td) return false
+    this.editCellFromTd(td)
+    return true
   }
 
   /** The element a client point lands on — the same answer Selecto's own click
