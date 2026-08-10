@@ -441,6 +441,17 @@ export class Editor {
     // on every resize costs a comparison.
     window.addEventListener('resize', () => this.applyPhoneChrome(window.innerWidth <= 700))
 
+    // On a narrow phone the bar scrolls sideways, which makes it a clipping
+    // container — so the menus hanging off ＋ and ⋯ are positioned against the
+    // VIEWPORT instead (styles.css). The one thing they cannot read from CSS is
+    // where the bar ends: its height moves with the safe-area insets, which
+    // differ per device and change when the phone rotates.
+    const publishBarBottom = () =>
+      this.root.style.setProperty('--ed-bar-bottom', `${Math.round(bar.getBoundingClientRect().bottom)}px`)
+    new ResizeObserver(publishBarBottom).observe(bar)
+    window.addEventListener('resize', publishBarBottom)
+    publishBarBottom()
+
     this.restorePanelWidths()
     this.canvas = new SlideCanvas(canvasWrap, this.store)
     this.canvas.onCommentModeChange = (on) => commentB.classList.toggle('ed-btn-armed', on)
