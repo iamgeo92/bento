@@ -739,7 +739,13 @@ export class Editor {
    * That is the width at which "leave the panel open" stops being free.
    */
   private get panelsAreDrawers(): boolean {
-    return this.phoneQuery?.matches ?? window.innerWidth <= 700
+    // The 700px here is the SAME constant as fitTopbar()'s phone check and the
+    // `@media (max-width: 700px)` block that turns the panels into drawers —
+    // this asks the panel question, not the topbar one. #239 replaced the bar's
+    // width-breakpoint machinery (a matchMedia `phoneQuery`) with measuring, and
+    // that is why the old `phoneQuery?.matches ??` prefix that used to sit here
+    // no longer compiles. It was only ever a cache of this same comparison.
+    return window.innerWidth <= 700
   }
 
   /** Close a panel if it is open — idempotent, unlike togglePanel. */
