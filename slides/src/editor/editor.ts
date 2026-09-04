@@ -20,14 +20,6 @@ import { paletteSignature, resolveThemeRefs } from '../palette'
 import { SlideCanvas } from './canvas'
 import { PropsPanel } from './panels'
 import { openCtxMenu, type CtxItem } from './ctxmenu'
-
-/** How long a finger must rest before a press becomes a menu. 500ms is what
- *  iOS itself uses for the callout, so it matches the muscle memory already on
- *  the device. */
-const LONG_PRESS_MS = 500
-/** …and how far it may wander first. Past this it was a drag or a pan. */
-const LONG_PRESS_SLOP = 10
-
 import { startPresentation } from '../present'
 // serializeFile (plain output) is deliberately NOT imported here: every path
 // in this file writes a real file for a person, so all of them must inherit an
@@ -59,6 +51,13 @@ const JUST_UPDATED_KEY = 'bento-just-updated'
 
 /** Show the language search once the available list outgrows a glance. */
 const SEARCH_FROM = 8
+
+/** How long a finger must rest before a press becomes a menu. 500ms is what
+ *  iOS itself uses for the callout, so it matches the muscle memory already on
+ *  the device. */
+const LONG_PRESS_MS = 500
+/** …and how far it may wander first. Past this it was a drag or a pan. */
+const LONG_PRESS_SLOP = 10
 
 const SHAPE_MENU: Array<{ kind: ShapeKind; label: string; icon: string; draw?: 'line' | 'path' | 'connector' | 'free' | 'poly'; tip: string }> = [
   { kind: 'rect', label: 'Rectangle', icon: ICONS.rect, tip: 'A rectangle — rounded corners, fills, gradients and shadows in the panel' },
@@ -472,6 +471,17 @@ export class Editor {
       attributes: true, attributeFilter: ['style', 'hidden'],
     })
 
+    // On a narrow phone the bar scrolls sideways, which makes it a clipping
+    // container — so the menus hanging off ＋ and ⋯ are positioned against the
+    // VIEWPORT instead (styles.css). The one thing they cannot read from CSS is
+    // where the bar ends: its height moves with the safe-area insets, which
+    // differ per device and change when the phone rotates.
+    const publishBarBottom = () =>
+      this.root.style.setProperty('--ed-bar-bottom', `${Math.round(bar.getBoundingClientRect().bottom)}px`)
+    new ResizeObserver(publishBarBottom).observe(bar)
+    window.addEventListener('resize', publishBarBottom)
+    publishBarBottom()
+
     this.restorePanelWidths()
     this.canvas = new SlideCanvas(canvasWrap, this.store)
     this.canvas.onCommentModeChange = (on) => commentB.classList.toggle('ed-btn-armed', on)
@@ -734,6 +744,29 @@ export class Editor {
     el.classList.toggle('ed-collapsed')
     this.updatePanelChevrons()
     // the canvas wrap resizes; its ResizeObserver re-fits the stage
+  }
+
+  /**
+   * Below 700px the two side panels stop being columns and become overlay
+   * DRAWERS (styles.css) — they cover the canvas rather than sitting beside it.
+   * That is the width at which "leave the panel open" stops being free.
+   */
+  private get panelsAreDrawers(): boolean {
+    // The 700px here is the SAME constant as fitTopbar()'s phone check and the
+    // `@media (max-width: 700px)` block that turns the panels into drawers —
+    // this asks the panel question, not the topbar one. #239 replaced the bar's
+    // width-breakpoint machinery (a matchMedia `phoneQuery`) with measuring, and
+    // that is why the old `phoneQuery?.matches ??` prefix that used to sit here
+    // no longer compiles. It was only ever a cache of this same comparison.
+    return window.innerWidth <= 700
+  }
+
+  /** Close a panel if it is open — idempotent, unlike togglePanel. */
+  private closePanel(side: 'left' | 'right') {
+    const el = side === 'left' ? this.sidebar : this.props
+    if (el.classList.contains('ed-collapsed')) return
+    el.classList.add('ed-collapsed')
+    this.updatePanelChevrons()
   }
 
   // --- Save dropdown: copy / new deck / template -----------------------------
@@ -1592,7 +1625,14 @@ export class Editor {
       btn(ICONS.trash, '', (ev) => { ev.stopPropagation(); this.deleteSlide(i) }, t('Delete slide')),
     )
     item.append(num, surface, tools)
-    item.addEventListener('click', () => this.store.goTo(i))
+    item.addEventListener('click', () => {
+      this.store.goTo(i)
+      // On a phone the slide list is a drawer laid OVER the canvas, so picking
+      // a slide left the answer hidden behind the question — you had to find
+      // and press the ☰ toggle again to see the slide you just chose. On a wide
+      // screen the list is a column beside the canvas and rightly stays put.
+      if (this.panelsAreDrawers) this.closePanel('left')
+    })
     if (!isState) this.wireThumbDrag(item, i)
     return item
   }
