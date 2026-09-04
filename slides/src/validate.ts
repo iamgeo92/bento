@@ -25,6 +25,7 @@
 import type { BentoDoc, Slide, SlideElement, TextElement } from './model.ts'
 import { MODEL_KEYS } from './modelkeys.generated.ts'
 import { measureElements } from './measure.ts'
+import { eachRef, paletteOf, parseThemeRef, resolveRef, _readPath } from './palette.ts'
 
 export type Severity = 'error' | 'warning' | 'info'
 
@@ -138,6 +139,10 @@ export function validateDoc(doc: BentoDoc, opts: ValidateOpts = {}): ValidateRes
   const slideIds = new Set(doc.slides.map((s) => s.id))
   const assets = doc.assets ?? {}
   const arrivals = morphArrivals(doc)
+  // Every slide any element can jump to. A hidden slide is reachable ONLY this
+  // way, so one with no inbound link is in the file and in nobody's path.
+  const linkTargets = new Set<string>()
+  for (const sl of doc.slides) for (const el of sl.elements) if (el.link) linkTargets.add(el.link)
 
   // ---- document level ------------------------------------------------------
   for (const k of Object.keys(doc)) {
@@ -152,6 +157,25 @@ export function validateDoc(doc: BentoDoc, opts: ValidateOpts = {}): ValidateRes
         message: `Font "${f.family}" points at asset "${f.asset}", which is not in doc.assets — the face will not load and text falls back silently.` })
     }
   }
+  // A live-shared deck carries the keys to its own room — that is how opening a
+  // copy joins a session with no account and nothing to configure. The file IS
+  // the invitation, and that is deliberate.
+  //
+  // It is also invisible. Nothing on screen and nothing in the JSON's shape says
+  // "this document grants write access to whoever holds it", so anyone handing
+  // the file to a chat, a ticket or an agent harness is transferring a
+  // capability while believing they are sharing a document.
+  //
+  // Reported only when PRIVATE material is present: a reader or invite copy has
+  // `collab` and no secrets, and flagging that would be noise. Info, not a
+  // warning — carrying these keys in your own working file is correct.
+  const secrets = (['writerPriv', 'ownerPriv', 'invite'] as const)
+    .filter((k) => (doc.collab as Record<string, unknown> | undefined)?.[k])
+  if (secrets.length) {
+    add({ code: 'collab-secrets-present', severity: 'info', path: 'collab',
+      message: `This deck carries live-session private keys (${secrets.join(', ')}) — anything that receives this file or its JSON can join the room and write to it. Expected in your own working file; strip it (Save → a share copy, or Stop sharing) before handing the deck to a chat, a ticket or an agent.` })
+  }
+
   const embedded = new Set((doc.fonts ?? []).map((f) => f.family.trim().toLowerCase()))
   const seenFallback = new Set<string>()
   const checkFamily = (stack: string | undefined, where: Omit<Finding, 'code' | 'severity' | 'message'>) => {
@@ -165,6 +189,40 @@ export function validateDoc(doc: BentoDoc, opts: ValidateOpts = {}): ValidateRes
       message: `"${stack.split(',')[0].trim()}" is not in doc.fonts, so it renders only for viewers who happen to have it installed — everyone else silently gets the next family in the stack. Embed the woff2 in doc.assets and declare it in doc.fonts.` })
   }
   checkFamily(doc.theme?.fontFamily, { path: 'theme.fontFamily' })
+  checkFamily(doc.theme?.headingFamily, { path: 'theme.headingFamily' })
+
+  // ---- brand palette references --------------------------------------------
+  // A `themeRefs` entry says a colour came from a palette slot, so editing the
+  // palette rewrites it. Both failures here are silent: a ref nobody can
+  // resolve simply never updates, and a literal that disagrees with its ref is
+  // about to be overwritten by the next palette edit — which looks like the
+  // app changing a colour on its own.
+  {
+    const palette = paletteOf(doc)
+    eachRef(doc, ({ slide, element, path, token }) => {
+      const at = { slide: slide.id, ...(element ? { element: element.id } : {}) }
+      const parsed = parseThemeRef(token)
+      if (!parsed) {
+        add({ ...at, code: 'theme-ref-malformed', severity: 'warning', path: `themeRefs.${path}`,
+          message: `"${token}" is not a palette reference — expected a slot name, optionally with a shift like "accent1 -20%". The colour is left as it is and will not follow the palette.` })
+        return
+      }
+      if (!palette[parsed.slot]) {
+        add({ ...at, code: 'theme-ref-unknown-slot', severity: 'warning', path: `themeRefs.${path}`,
+          message: `Palette slot "${parsed.slot}" is empty, so this colour will not follow the palette. Set it in the theme, or drop the reference.` })
+        return
+      }
+      const want = resolveRef(token, palette)
+      const have = _readPath(element ?? slide, path)
+      if (typeof have !== 'string') {
+        add({ ...at, code: 'theme-ref-dangling', severity: 'warning', path: `themeRefs.${path}`,
+          message: `There is no colour at "${path}" for this reference to control — it does nothing. Remove it, or restore the property.` })
+      } else if (want && have.toLowerCase() !== want.toLowerCase()) {
+        add({ ...at, code: 'theme-ref-stale', severity: 'info', path,
+          message: `This colour is ${have} but its reference "${token}" resolves to ${want}, so the next palette change will replace it. If ${have} was deliberate, clear the reference.` })
+      }
+    })
+  }
 
   for (const slide of doc.slides) {
     const sid = slide.id
@@ -180,6 +238,10 @@ export function validateDoc(doc: BentoDoc, opts: ValidateOpts = {}): ValidateRes
         add({ code: 'unknown-key', severity: 'warning', slide: sid, path: k,
           message: `Slide key "${k}" is not part of the format — it is ignored.` })
       }
+    }
+    if (slide.hidden && !slide.stateOf && !linkTargets.has(sid)) {
+      add({ code: 'unreachable-hidden-slide', severity: 'info', slide: sid, path: 'hidden',
+        message: `Hidden, and nothing links to it — this slide cannot be reached at all while presenting. Give an element a link to it, or unhide it.` })
     }
     if (slide.stateOf && !slideIds.has(slide.stateOf)) {
       add({ code: 'broken-state-parent', severity: 'error', slide: sid, path: 'stateOf',
