@@ -34,6 +34,11 @@ export class SlideCanvas {
   private zoom = 1
   private zoomLabel: HTMLElement | null = null
   private editing: HTMLElement | null = null
+  /** Slide identity captured when an inline edit begins. Element ids may be
+   *  shared across duplicated slides, so resolving through store.slide at
+   *  commit time can write into the wrong slide after navigation or a remote
+   *  deletion. */
+  private editingSlideId: string | null = null
   /** startTextEdit swapped the rendered form for raw source (a field or a
    *  formula), so commit must re-render even if the text is unchanged. */
   private editingShowedRaw = false
@@ -248,7 +253,16 @@ export class SlideCanvas {
     }, true)
 
     this.stage.addEventListener('dblclick', (ev) => {
-      const textEl = (ev.target as HTMLElement).closest<HTMLElement>('.bento-el-text')
+      // Look for TextElement, and then CodeElement
+      const selectors = [
+        '.bento-el-text',
+        '.bento-el-code'
+      ]
+      var textEl: HTMLElement | null = null
+      for (const selector of selectors) {
+        textEl = (ev.target as HTMLElement).closest<HTMLElement>(selector)
+        if (textEl) break
+      }
       if (textEl) { this.startTextEdit(textEl); return }
       const td = (ev.target as HTMLElement).closest<HTMLElement>('.bento-el-table td[data-c]')
       if (td) this.editCellFromTd(td)
@@ -575,6 +589,10 @@ export class SlideCanvas {
   }
 
   render() {
+    // A slide switch is a hard boundary for an inline edit. Commit against
+    // the slide where editing began (or discard if that slide was remotely
+    // deleted) before replacing the canvas DOM.
+    if (this.editing && this.editingSlideId !== this.store.slide?.id) this.commitTextEdit()
     // Don't repaint out from under an in-progress inline edit. A remote collab
     // op landing must NOT tear down the text/cell node you're typing in — that
     // steals focus and resets the caret (the #1 rough edge reported at launch).
@@ -1025,7 +1043,36 @@ export class SlideCanvas {
       this.store.select(this.expandGroups(ids))
       if (e.isDragStartEnd) {
         e.inputEvent.preventDefault()
+        // Hand this same press to Moveable, so pressing an unselected element and
+        // dragging moves it without needing a second press. Moveable cannot accept
+        // the press until its target has actually changed, and waitToChangeTarget()
+        // resolves only from componentDidMount/componentDidUpdate — the wait is a
+        // render long and there is NO synchronous path to shorten it.
+        //
+        // A fast click releases inside that gap. dragStart then replays a press
+        // whose mouseup has already been and gone, so Moveable begins a drag that
+        // nothing will ever end: the element follows the cursor, and the click that
+        // finally stops it COMMITS the move to the document (#260). Silent, and the
+        // user was only trying to select something.
+        //
+        // So cancel the handoff when the release wins the race. `mouseup`, not
+        // `pointerup` — Gesto listens for mouse events. Capture phase, so a handler
+        // that stops propagation cannot hide it from us. The guarded window is
+        // complete: selectEnd runs inside the mousedown dispatch, so a release
+        // cannot land before the listener exists. Measured at 40x CPU throttle
+        // (the reporter's symptom is hardware-speed dependent): 22/24 clicks stuck
+        // without this, 0/24 with it, deliberate held drags unaffected.
+        //
+        // Do NOT "simplify" this by making the target swap synchronous — that means
+        // reaching into react-moveable's private _checkChangeTargets(). The real fix
+        // is to stop replaying a stale press and start the drag from a live move
+        // event instead; that is a rework of this gesture, not a tidy-up.
+        let released = false
+        const onMouseUp = () => { released = true }
+        window.addEventListener('mouseup', onMouseUp, { capture: true, once: true })
         this.moveable.waitToChangeTarget().then(() => {
+          window.removeEventListener('mouseup', onMouseUp, true)
+          if (released) return
           this.moveable.dragStart(e.inputEvent)
         })
       }
@@ -1047,10 +1094,23 @@ export class SlideCanvas {
     // even when the text did NOT change, and only a re-render can do that.
     this.editingShowedRaw = false
     if (model?.type === 'text' && typeof model.html === 'string' && /\{\{|\$/.test(model.html)) {
-      inner.innerHTML = model.html
+      // SANITIZED, even though the point of the swap is to show what the model
+      // holds. This is the only place raw model html reaches the live canvas —
+      // the render path has always cleaned it — so without this, double-
+      // clicking a text box in a deck someone sent you ran its script, and the
+      // `{{`-or-`$` gate is no barrier at all: one literal dollar sign opens it.
+      // Nothing is lost: the sanitizer unwraps tags and strips attributes, so a
+      // {{page:2}} token and `$E=mc^2$` TeX source are plain text to it and
+      // survive verbatim, which is the entire purpose of showing the raw html.
+      inner.innerHTML = sanitizeHtml(model.html)
+      this.editingShowedRaw = true
+    } else if (model?.type === 'code' && typeof model.content === 'string') {
+      // When editing code, we always treat the content as raw text to preserve formatting.
+      inner.innerText = model.content
       this.editingShowedRaw = true
     }
     this.editing = node
+    this.editingSlideId = this.store.slide.id
     node.classList.add('bento-editing')
     inner.contentEditable = 'true'
     inner.focus()
@@ -1103,20 +1163,31 @@ export class SlideCanvas {
     const node = this.editing
     if (!node) return
     if (this.editingCell) { this.commitCellEdit(node); return }
+    const slideId = this.editingSlideId
     this.editing = null
+    this.editingSlideId = null
     this.onTextEditChange?.(undefined)
     const inner = node.querySelector<HTMLElement>('.bento-text-inner')
     const id = node.dataset.elId
     node.classList.remove('bento-editing')
     if (!inner || !id) return
     inner.contentEditable = 'false'
+    // For code, we care about the raw innerText
+    const text = inner.innerText
     // drop the zero-width caret spacers autoformat leaves behind
     const html = sanitizeHtml(inner.innerHTML.replace(/\u200B/g, '').replace(/\\([*_~`-])/g, '$1'))
     const grownH = Math.max(parseFloat(node.style.height) || 0, inner.scrollHeight)
-    const el = this.store.element(id)
+    const el = this.store.doc.slides
+      .find((slide) => slide.id === slideId)
+      ?.elements.find((element) => element.id === id)
     if (el && el.type === 'text' && (el.html !== html || grownH > el.h)) {
       this.store.commit(() => {
         el.html = html
+        if (grownH > el.h) el.h = Math.ceil(grownH)
+      })
+    } else if (el && el.type === 'code' && (el.content !== text || grownH > el.h)) {
+      this.store.commit(() => {
+        el.content = text
         if (grownH > el.h) el.h = Math.ceil(grownH)
       })
     } else if (this.editingShowedRaw) {
@@ -1162,6 +1233,7 @@ export class SlideCanvas {
     const inner = td.querySelector<HTMLElement>('.bento-cell-inner')
     if (!node || !inner) return
     this.editing = node
+    this.editingSlideId = this.store.slide.id
     this.editingCell = { r, c }
     node.classList.add('bento-editing')
     inner.contentEditable = 'true'
@@ -1194,7 +1266,9 @@ export class SlideCanvas {
   private commitCellEdit(node: HTMLElement) {
     const cell = this.editingCell!
     const id = node.dataset.elId
+    const slideId = this.editingSlideId
     this.editing = null
+    this.editingSlideId = null
     this.editingCell = null
     this.onTextEditChange?.(undefined)
     node.classList.remove('bento-editing')
@@ -1203,10 +1277,12 @@ export class SlideCanvas {
     if (!inner || !id) return
     inner.contentEditable = 'false'
     const html = sanitizeHtml(inner.innerHTML.replace(/\u200B/g, '').replace(/\\([*_~`-])/g, '$1'))
-    const el = this.store.element(id)
+    const el = this.store.doc.slides
+      .find((slide) => slide.id === slideId)
+      ?.elements.find((element) => element.id === id)
     if (el && el.type === 'table' && el.rows[cell.r]?.cells[cell.c] && el.rows[cell.r].cells[cell.c].html !== html) {
       this.store.commit(() => {
-        const tb = this.store.element(id) as TableElement
+        const tb = el as TableElement
         if (tb.rows[cell.r]?.cells[cell.c]) tb.rows[cell.r].cells[cell.c].html = html
       })
     } else {
