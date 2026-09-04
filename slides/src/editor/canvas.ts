@@ -212,6 +212,22 @@ export class SlideCanvas {
       // snapped straight back and the slide zooms about the wrong point.
       this.pinching = true
       ;(this.moveable as unknown as { stopDrag?: () => void }).stopDrag?.()
+      // stopDrag() ABANDONS the gesture — it does not run dragEnd, so
+      // commitFrames() never fires, no store.commit happens, and the
+      // store 'doc' listener that re-renders from the model never runs.
+      // The node therefore keeps the inline left/top that mv.on('drag')
+      // wrote while the first finger was moving, and sits at a position the
+      // document has never held. The model is safe; the VIEW is the lie, and
+      // it does not self-correct — it survives deselection and persists until
+      // some unrelated commit forces a render. So put the node back where the
+      // model says it is. Exactly inverts the drag handler, which writes
+      // left/top and nothing else.
+      for (const node of this.selectedNodes()) {
+        const el = this.store.element(node.dataset.elId ?? '')
+        if (!el) continue
+        node.style.left = `${el.x}px`
+        node.style.top = `${el.y}px`
+      }
     }
     this.scroller.addEventListener('touchstart', (ev) => {
       if (ev.touches.length < 2) { pinch = null; return }
